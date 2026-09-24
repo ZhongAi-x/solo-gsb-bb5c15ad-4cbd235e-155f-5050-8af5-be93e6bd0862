@@ -776,3 +776,161 @@ def test_cut_plan_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/tabs 闭合外环微桥布置（只读）
+# ---------------------------------------------------------------------------
+
+def test_tabs_basic_square(client):
+    pid = _mk(client, "M0,0h40v40h-40Z")
+    r = client.post(f"/paths/{pid}/tabs",
+                    json={"count": 4, "width": 2, "corner_margin": 1})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["count"] == 4
+    assert body["width"] == 2.0
+    assert body["corner_margin"] == 1.0
+    assert body["total_contours"] == 1
+    assert body["total_tabs"] == 4
+    assert body["total_unplaced"] == 0
+    assert body["skipped_contours"] == []
+
+    c0 = body["contours"][0]
+    assert c0["original_index"] == 0
+    assert c0["role"] == "outer"
+    assert c0["depth"] == 0
+    assert c0["perimeter"] == 160.0
+    assert c0["sector_length"] == 40.0
+    assert c0["requested"] == 4
+    assert c0["placed"] == 4
+    assert c0["unplaced"] == 0
+
+    tabs = c0["tabs"]
+    assert [t["sector"] for t in tabs] == [0, 1, 2, 3]
+    assert [t["target_s"] for t in tabs] == [20.0, 60.0, 100.0, 140.0]
+    assert [t["center_s"] for t in tabs] == [20.0, 60.0, 100.0, 140.0]
+    t0 = tabs[0]
+    assert t0["start_s"] == 19.0 and t0["end_s"] == 21.0
+    assert t0["center"] == {"x": 20.0, "y": 0.0}
+    assert t0["start"] == {"x": 19.0, "y": 0.0}
+    assert t0["end"] == {"x": 21.0, "y": 0.0}
+    assert tabs[1]["center"] == {"x": 40.0, "y": 20.0}
+    assert tabs[2]["center"] == {"x": 20.0, "y": 40.0}
+    assert tabs[3]["center"] == {"x": 0.0, "y": 20.0}
+
+
+def test_tabs_reports_unplaced(client):
+    # 桥宽 30、8 扇区：可行区间被排斥区隔断，4 放 4 未放
+    pid = _mk(client, "M0,0h40v40h-40Z")
+    body = client.post(f"/paths/{pid}/tabs",
+                       json={"count": 8, "width": 30,
+                             "corner_margin": 0}).json()
+    c0 = body["contours"][0]
+    assert c0["placed"] == 4
+    assert c0["unplaced"] == 4
+    assert body["total_tabs"] == 4
+    assert body["total_unplaced"] == 4
+    assert [t["sector"] for t in c0["tabs"]] == [0, 2, 4, 6]
+    assert [t["center_s"] for t in c0["tabs"]] == [15.0, 55.0, 95.0, 135.0]
+
+
+def test_tabs_skips_hole_open_degenerate(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z "
+                     "M5,5 L8,5 L5,5 Z M50,0 L60,0 L60,10")
+    body = client.post(f"/paths/{pid}/tabs",
+                       json={"count": 2, "width": 1,
+                             "corner_margin": 0}).json()
+    assert body["total_contours"] == 1
+    assert [c["original_index"] for c in body["contours"]] == [0]
+    skipped = {(s["original_index"], s["role"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert skipped == {(1, "hole", "hole"),
+                       (2, "degenerate", "degenerate"),
+                       (3, "open", "open")}
+
+
+def test_tabs_island_outer_participates(client):
+    pid = _mk(client,
+              "M0,0h100v100h-100Z M10,10h80v80h-80Z M40,40h20v20h-20Z")
+    body = client.post(f"/paths/{pid}/tabs",
+                       json={"count": 2, "width": 1,
+                             "corner_margin": 0}).json()
+    assert body["total_contours"] == 2
+    assert [c["original_index"] for c in body["contours"]] == [0, 2]
+    assert body["skipped_contours"] == [
+        {"original_index": 1, "role": "hole", "reason": "hole"}]
+    assert body["total_tabs"] == 4
+
+
+def test_tabs_no_valid_outer_returns_empty(client):
+    pid = _mk(client, "M0,0 L10,0 L10,10")
+    body = client.post(f"/paths/{pid}/tabs",
+                       json={"count": 3, "width": 1,
+                             "corner_margin": 0}).json()
+    assert body["total_contours"] == 0
+    assert body["contours"] == []
+    assert body["total_tabs"] == 0
+    assert body["total_unplaced"] == 0
+    assert body["skipped_contours"] == [
+        {"original_index": 0, "role": "open", "reason": "open"}]
+
+
+def test_tabs_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    payload = {"count": 4, "width": 2, "corner_margin": 0.5}
+    assert client.post(f"/paths/{pid}/tabs", json=payload).status_code == 200
+    # 即时布置不写库，重复调用结果一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/tabs", json=payload).json()
+    b2 = client.post(f"/paths/{pid}/tabs", json=payload).json()
+    assert b1 == b2
+
+
+def test_tabs_404(client):
+    r = client.post("/paths/999999/tabs",
+                    json={"count": 1, "width": 1, "corner_margin": 0})
+    assert r.status_code == 404
+
+
+def test_tabs_422_on_invalid_params(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/tabs"
+    good = {"count": 2, "width": 1, "corner_margin": 0}
+    # count 必须为正整数
+    for bad in ({"count": 0}, {"count": -2}, {"count": 2.5}, {"count": "x"}):
+        assert client.post(url, json={**good, **bad}).status_code == 422
+    # width 必须为正的有限数
+    for bad in ({"width": 0}, {"width": -1}, {"width": "nan"}):
+        assert client.post(url, json={**good, **bad}).status_code == 422
+    # corner_margin 必须为非负有限数
+    for bad in ({"corner_margin": -0.5}, {"corner_margin": "nan"}):
+        assert client.post(url, json={**good, **bad}).status_code == 422
+    # 缺字段
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"count": 2, "width": 1}).status_code == 422
+    assert client.post(url, json={"count": 2,
+                                  "corner_margin": 0}).status_code == 422
+    # 非有限数（JSON 解析为 Infinity）必须是 422 而不是 500
+    for content in ('{"count": 2, "width": 1e999, "corner_margin": 0}',
+                    '{"count": 2, "width": 1, "corner_margin": -1e999}'):
+        r = client.post(url, content=content,
+                        headers={"Content-Type": "application/json"})
+        assert r.status_code == 422
+
+
+def test_tabs_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/tabs",
+                    json={"count": 1, "width": 1, "corner_margin": 0})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+

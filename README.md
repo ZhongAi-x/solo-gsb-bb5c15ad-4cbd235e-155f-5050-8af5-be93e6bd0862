@@ -10,7 +10,10 @@
 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
 （按细分线段计算任意两轮廓边界的最小欧氏距离）、
 **`POST /paths/{id}/cut-plan` 闭合轮廓加工计划**
-（后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）
+（后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）、
+**`POST /paths/{id}/tabs` 闭合外环微桥布置**
+（沿细分折线建立弧长坐标，以周长等分扇区中点为目标选桥中心，
+桥段避开顶点拐角余量且互不重叠，报告未能放置数量）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -28,8 +31,9 @@
 │   ├── scanlines.py   # 水平扫描线填充区间：半开边求交、按层级交替合并，逐行输出
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
+│   ├── tabs.py        # 闭合外环微桥布置：弧长等分扇区选点、拐角余量与重叠约束、未放置统计
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（157 个）
+├── tests/             # pytest 单元 + API 端到端测试（184 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -404,6 +408,118 @@ curl -s -X POST localhost:8000/paths/1/cut-plan \
 - 路径不存在返回 `404`，`x` / `y` 缺失或非有限数返回 `422`，
   已存路径无法解析返回 `422`。
 
+### `POST /paths/{id}/tabs` — 闭合外环微桥（tabs）布置（只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写数据库**），仅对**闭合且非退化的外环（`outer`）**轮廓沿细分折线
+建立首尾相接的弧长坐标 `s ∈ [0, L)`（`L` 为轮廓周长），布置 `count`
+条微桥：
+
+- 周长等分为 `count` 个扇区，第 `j` 个扇区为
+  `[j*L/count, (j+1)*L/count)`，以扇区**中点**为桥段中心的目标弧长；
+- 桥宽 `width`：中心位于弧长 `c` 的桥段占据弧长区间
+  `[c - width/2, c + width/2]`；
+- **拐角余量**：每个细分顶点两侧各 `corner_margin` 弧长为余量区，
+  桥段不得跨入（桥端恰好落在余量区边界视为可行）；
+- **互不重叠**：两桥中心的环向弧长距离不得小于 `width`
+  （恰好相接视为可行，含 1e-9 相对容差）；
+- 按**轮廓原始索引**、再按**扇区顺序**依次布置：在扇区内的可行桥中心
+  中选取距目标最近者，**距离相同时取较小弧长**；每放置一桥立即从可行域
+  扣除其排斥区（中心两侧各 `width` 的环向邻域），影响后续扇区的选择；
+- 扇区内不存在可行桥中心时，该桥计入 `unplaced` 并继续下一扇区；
+- 孔洞（`hole`）、开放（`open`）与退化（`degenerate`）轮廓跳过并列入
+  `skipped_contours`；孔中岛（深度 2）是 `outer`，正常参与。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `count` | int | 每条外环轮廓的微桥数量，必须 **> 0** 的整数 |
+| `width` | number | 桥宽，必须 **> 0**（NaN/无穷/非数字返回 `422`） |
+| `corner_margin` | number | 顶点两侧拐角余量，必须 **≥ 0**（NaN/无穷返回 `422`） |
+
+```bash
+# 外方 0..40（周长 160）：4 条宽 2 的微桥，拐角余量 1
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h40v40h-40Z"
+}'
+curl -s -X POST localhost:8000/paths/1/tabs \
+  -H 'Content-Type: application/json' \
+  -d '{"count": 4, "width": 2, "corner_margin": 1}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "count": 4,
+  "width": 2.0,
+  "corner_margin": 1.0,
+  "total_contours": 1,
+  "total_tabs": 4,
+  "total_unplaced": 0,
+  "contours": [
+    {
+      "original_index": 0,
+      "role": "outer",
+      "depth": 0,
+      "perimeter": 160.0,
+      "sector_length": 40.0,
+      "requested": 4,
+      "placed": 4,
+      "unplaced": 0,
+      "tabs": [
+        {"sector": 0, "target_s": 20.0, "center_s": 20.0,
+         "start_s": 19.0, "end_s": 21.0,
+         "center": {"x": 20.0, "y": 0.0},
+         "start": {"x": 19.0, "y": 0.0},
+         "end": {"x": 21.0, "y": 0.0}},
+        {"sector": 1, "target_s": 60.0, "center_s": 60.0,
+         "start_s": 59.0, "end_s": 61.0,
+         "center": {"x": 40.0, "y": 20.0},
+         "start": {"x": 40.0, "y": 19.0},
+         "end": {"x": 40.0, "y": 21.0}},
+        {"sector": 2, "target_s": 100.0, "center_s": 100.0,
+         "start_s": 99.0, "end_s": 101.0,
+         "center": {"x": 20.0, "y": 40.0},
+         "start": {"x": 21.0, "y": 40.0},
+         "end": {"x": 19.0, "y": 40.0}},
+        {"sector": 3, "target_s": 140.0, "center_s": 140.0,
+         "start_s": 139.0, "end_s": 141.0,
+         "center": {"x": 0.0, "y": 20.0},
+         "start": {"x": 0.0, "y": 21.0},
+         "end": {"x": 0.0, "y": 19.0}}
+      ]
+    }
+  ],
+  "skipped_contours": []
+}
+```
+
+- `contours[]`：参与布置的外环轮廓（按 `original_index` 升序），每项含
+  周长 `perimeter`、扇区长 `sector_length`、请求/已放置/未放置数量
+  （`requested` / `placed` / `unplaced`）与逐桥段列表 `tabs`；
+- `tabs[]`：按扇区顺序排列，每项含扇区序号 `sector`、目标弧长
+  `target_s`、桥段中心/起点/终点的弧长（`center_s` / `start_s` /
+  `end_s`）及对应坐标（`center` / `start` / `end`）；
+- `total_tabs` / `total_unplaced`：全部外环轮廓的已放置/未能放置总数；
+- `skipped_contours[]`：跳过的轮廓及 `reason`
+  （`hole` / `open` / `degenerate`）；
+- 路径不存在返回 `404`，`count` / `width` / `corner_margin` 缺失或非法
+  返回 `422`，已存路径无法解析返回 `422`。
+
+目标弧长恰落在顶点上时，桥中心退到余量区边界（余量为 0 时退半桥宽），
+两侧等距取较小弧长：
+
+```bash
+curl -s -X POST localhost:8000/paths/1/tabs \
+  -H 'Content-Type: application/json' \
+  -d '{"count": 2, "width": 2, "corner_margin": 0}'
+# -> 周长 160 两等分，目标 40 / 120 恰为顶点，中心取 39.0 / 119.0
+```
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -549,7 +665,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 157 passed
+pytest -q          # 184 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -571,7 +687,13 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 闭合轮廓加工计划的后代先加工（外-孔、外-孔-岛三层、同级孔全部先于父轮廓）、
 每轮最近细分顶点入刀与刀头停在入刀点的链式空走距离、距离相等时按原始索引、
 顶点序号决胜、曲线细分顶点入刀、开放与退化跳过、无有效轮廓空计划、
-两种填充规则一致、确定性与只读不落库、404/非有限起点 422 等。
+两种填充规则一致、确定性与只读不落库、404/非有限起点 422 等；
+微桥布置的弧长坐标与周长/扇区中点、目标落顶点时等距取较小弧长、
+拐角余量推开与桥端恰抵余量区边界可行、桥宽恰好适配单条边、桥宽过大隔扇区
+放置与未放置统计、排斥区推动后续扇区选点且桥段互不重叠、中心落在所属扇区、
+孔中岛参与而 hole/open/degenerate 跳过、多外环按原始索引处理、
+曲线细分折线选点、空路径/仅开放轮廓空结果、确定性、两种填充规则一致、
+参数非法 ValueError、只读不落库、404/非法参数 422 等。
 
 ## 数据存储
 

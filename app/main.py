@@ -7,6 +7,7 @@
     POST /paths/{id}/scanlines   只读：水平扫描线上的填充区间（供逐行加工）
     POST /paths/{id}/clearance   轮廓间安全间隙（最小欧氏距离）即时校验
     POST /paths/{id}/cut-plan    闭合轮廓加工计划（后代先加工 + 最近入刀点贪心）
+    POST /paths/{id}/tabs        闭合外环微桥布置（弧长等分扇区选点 + 拐角余量/重叠约束）
     POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}             查询原始路径、规范化结果及边界警告
     GET  /healthz                存活/就绪探针
@@ -32,6 +33,7 @@ from .diff import compare_normalized
 from .metrics import compute_metrics
 from .scanlines import MAX_SCANLINES, compute_scanlines
 from .svggeo import SVGPathError, analyze_contours, normalize_path
+from .tabs import compute_tabs
 
 
 @asynccontextmanager
@@ -42,10 +44,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.5.0",
+    version="1.6.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
                 "支持填充面积与面积质心分析、水平扫描线填充区间、"
                 "轮廓间安全间隙校验、闭合轮廓加工计划"
+                "、闭合外环微桥布置"
                 "与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
@@ -133,6 +136,22 @@ class CutPlanIn(BaseModel):
     def _finite(cls, v: float) -> float:
         if not math.isfinite(v):
             raise ValueError("刀头起点坐标必须是有限数值")
+        return v
+
+
+class TabsIn(BaseModel):
+    count: int = Field(..., gt=0,
+                       description="每条外环轮廓的微桥数量（> 0 的整数）")
+    width: float = Field(..., gt=0,
+                         description="微桥桥宽（>0，必须为有限数值）")
+    corner_margin: float = Field(..., ge=0,
+                                 description="顶点两侧拐角余量（≥0，必须为有限数值）")
+
+    @field_validator("width", "corner_margin")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("width / corner_margin 必须是有限数值")
         return v
 
 
@@ -356,4 +375,27 @@ def cut_plan(path_id: int,
                             detail=f"SVG path 无法解析: {exc}")
 
     result = compute_cut_plan(contours, start_x=payload.x, start_y=payload.y)
+    return {"id": path_id, "fill_rule": row["fill_rule"], **result}
+
+
+@app.post("/paths/{path_id}/tabs")
+def tabs(path_id: int,
+         payload: TabsIn,
+         conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    try:
+        result = compute_tabs(contours, count=payload.count,
+                              width=payload.width,
+                              corner_margin=payload.corner_margin)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=str(exc))
     return {"id": path_id, "fill_rule": row["fill_rule"], **result}
